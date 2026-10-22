@@ -1344,11 +1344,19 @@ st.caption("ROC curves, confusion matrices, the classification report and featur
 if df is None:
     st.info("The dataset is needed to regenerate evaluation plots.")
 else:
+    if "show_eval" not in st.session_state:
+        st.session_state["show_eval"] = False
+
     if st.button("Generate evaluation plots", key="run_eval"):
-        st.session_state["run_eval"] = True
-    if st.session_state.get("run_eval"):
+        st.session_state["show_eval"] = True
+
+    if st.session_state["show_eval"]:
         with st.spinner("Training the notebook's eight pipelines..."):
-            repro = run_notebook_evaluation(str(dataset_path), dataset_path.stat().st_mtime)
+            repro = run_notebook_evaluation(
+                str(dataset_path),
+                dataset_path.stat().st_mtime
+            )
+
         if "error" in repro:
             st.error(repro["error"])
             repro = None
