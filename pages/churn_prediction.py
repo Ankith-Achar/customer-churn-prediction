@@ -32,6 +32,8 @@ st.markdown(
     }
     h1 {
         font-size: 1.7rem !important;
+        margin-top: 0.5rem !important;
+        padding-top: 0.25rem !important;
         color: var(--navy);
         padding: 0 0 0.2rem 0 !important;
     }
