@@ -1,4 +1,4 @@
-```python
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -75,12 +75,11 @@ st.caption(
 )
 
 # ---------------------------------------------------------
-# Load saved model
+# Load model
 # ---------------------------------------------------------
 if not MODEL_PATH.exists():
     st.error(
-        "Model file not found. Make sure "
-        "best_churn_model.pkl is inside the models folder."
+        f"Model file not found: {MODEL_PATH}"
     )
     st.stop()
 
@@ -91,37 +90,55 @@ except Exception as e:
     st.stop()
 
 
-def get_classifier(estimator):
-    """Return the final classifier from a supported sklearn Pipeline."""
+# ---------------------------------------------------------
+# Find dataset
+# ---------------------------------------------------------
+def find_dataset():
+    possible_paths = [
+        DATA_DIR / "WA_Fn-UseC_-Telco-Customer-Churn.csv",
+        ROOT / "WA_Fn-UseC_-Telco-Customer-Churn.csv"
+    ]
+
+    for path in possible_paths:
+        if path.exists():
+            return path
+
+    # Also accept a suffixed copy, such as the downloaded (8).csv.
+    if DATA_DIR.exists():
+        matches = list(DATA_DIR.glob("*Telco*Customer*Churn*.csv"))
+        if matches:
+            return matches[0]
+
+    return None
+
+
+# ---------------------------------------------------------
+# Global feature importance
+# ---------------------------------------------------------
+def get_feature_importance(estimator, input_columns):
+    classifier = estimator
+
     if hasattr(estimator, "named_steps"):
         steps = list(estimator.named_steps.values())
         if steps:
-            return steps[-1]
-    return estimator
-
-
-def get_feature_importance(estimator, input_columns):
-    """
-    Extract importance from the fitted model.
-    For a Pipeline, use transformed feature names when available.
-    """
-    classifier = get_classifier(estimator)
+            classifier = steps[-1]
 
     if hasattr(classifier, "feature_importances_"):
         values = np.asarray(
             classifier.feature_importances_
         ).ravel()
     elif hasattr(classifier, "coef_"):
-        coefficients = np.asarray(classifier.coef_)
-        values = np.mean(np.abs(coefficients), axis=0)
+        values = np.asarray(classifier.coef_)
+        if values.ndim > 1:
+            values = np.mean(np.abs(values), axis=0)
+        else:
+            values = np.abs(values)
     else:
         return None
 
     names = None
 
-    if hasattr(estimator, "feature_names_in_"):
-        names = list(estimator.feature_names_in_)
-
+    # Retrieve transformed feature names when possible.
     if hasattr(estimator, "named_steps"):
         for step in estimator.named_steps.values():
             if hasattr(step, "get_feature_names_out"):
@@ -131,10 +148,19 @@ def get_feature_importance(estimator, input_columns):
                     pass
 
     if names is None or len(names) != len(values):
-        if len(values) == len(input_columns):
+        if hasattr(estimator, "feature_names_in_"):
+            candidate_names = list(estimator.feature_names_in_)
+            if len(candidate_names) == len(values):
+                names = candidate_names
+
+    if names is None or len(names) != len(values):
+        if len(input_columns) == len(values):
             names = list(input_columns)
         else:
-            names = [f"Encoded feature {i + 1}" for i in range(len(values))]
+            names = [
+                f"Encoded feature {i + 1}"
+                for i in range(len(values))
+            ]
 
     result = pd.DataFrame({
         "Feature": names,
@@ -146,95 +172,140 @@ def get_feature_importance(estimator, input_columns):
     ).head(12)
 
 
-def find_dataset():
-    """Find the project's Telco CSV if it exists."""
-    candidates = [
-        DATA_DIR / "WA_Fn-UseC_-Telco-Customer-Churn.csv",
-        ROOT / "WA_Fn-UseC_-Telco-Customer-Churn.csv"
-    ]
-
-    for path in candidates:
-        if path.exists():
-            return path
-
-    return None
-
+# ---------------------------------------------------------
+# Individual SHAP explanation
+# ---------------------------------------------------------
 
 def get_shap_explanation(estimator, customer):
-    """
-    Try a model-agnostic SHAP explanation using real customer records
-    as background data. Return None with a message if unavailable.
-    """
     dataset_path = find_dataset()
 
     if dataset_path is None:
-        return None, (
-            "The Telco dataset CSV was not found. Place the original CSV "
-            "inside the data folder to enable individual SHAP explanations."
-        )
+        return None, "Telco dataset CSV not found in the data folder."
+
+    if not hasattr(estimator, "predict_proba"):
+        return None, "The saved model does not support predict_proba."
 
     try:
         import shap
 
         background = pd.read_csv(dataset_path)
 
-        # The original training dataset uses these same feature names.
-        if not set(FEATURES).issubset(background.columns):
-            return None, (
-                "The CSV does not contain all expected model features. "
-                "Individual SHAP explanations cannot be generated safely."
-            )
+        missing = [c for c in FEATURES if c not in background.columns]
+        if missing:
+            return None, "Missing dataset columns: " + ", ".join(missing)
 
         background = background[FEATURES].copy()
 
-        # Match input data types expected by the model.
-        for column in ["SeniorCitizen", "tenure"]:
-            background[column] = pd.to_numeric(
-                background[column], errors="coerce"
+        numeric_columns = [
+            "SeniorCitizen", "tenure", "MonthlyCharges", "TotalCharges"
+        ]
+        categorical_columns = [
+            c for c in FEATURES if c not in numeric_columns
+        ]
+
+        for col in numeric_columns:
+            background[col] = pd.to_numeric(
+                background[col], errors="coerce"
             )
 
-        for column in ["MonthlyCharges", "TotalCharges"]:
-            background[column] = pd.to_numeric(
-                background[column], errors="coerce"
-            )
-
-        background = background.dropna()
+        background = background.dropna().reset_index(drop=True)
 
         if background.empty:
-            return None, "No usable background records were found."
+            return None, "No usable rows found in the dataset."
 
         background = background.sample(
-            n=min(40, len(background)), random_state=42
+            n=min(30, len(background)), random_state=42
         )
 
-        # Model-agnostic SHAP works through the saved estimator's
-        # predict_proba interface, including supported Pipelines.
-        if not hasattr(estimator, "predict_proba"):
-            return None, (
-                "This model does not provide predict_proba, so the "
-                "current probability-based SHAP explanation is unavailable."
+        # Build a consistent category mapping from the dataset and input.
+        category_maps = {}
+
+        for col in categorical_columns:
+            categories = list(
+                background[col].dropna().astype(str).unique()
             )
 
-        explainer = shap.Explainer(
-            lambda data: estimator.predict_proba(
-                pd.DataFrame(data, columns=FEATURES)
-            )[:, list(estimator.classes_).index(1)],
-            background,
-            algorithm="permutation"
+            input_value = str(customer.iloc[0][col])
+            if input_value not in categories:
+                categories.append(input_value)
+
+            category_maps[col] = {
+                value: i for i, value in enumerate(categories)
+            }
+
+        def encode_frame(frame):
+            result = frame[FEATURES].copy()
+
+            for col in categorical_columns:
+                result[col] = (
+                    result[col].astype(str)
+                    .map(category_maps[col])
+                    .astype(float)
+                )
+
+            for col in numeric_columns:
+                result[col] = pd.to_numeric(
+                    result[col], errors="coerce"
+                )
+
+            return result.astype(float)
+
+        def decode_frame(array):
+            result = pd.DataFrame(array, columns=FEATURES)
+
+            for col in categorical_columns:
+                reverse_map = {
+                    float(i): value
+                    for value, i in category_maps[col].items()
+                }
+
+                def decode_value(value):
+                    number = float(value)
+                    nearest = min(
+                        reverse_map,
+                        key=lambda key: abs(key - number)
+                    )
+                    return reverse_map[nearest]
+
+                result[col] = result[col].map(decode_value)
+
+            for col in numeric_columns:
+                result[col] = pd.to_numeric(
+                    result[col], errors="coerce"
+                )
+
+            return result[FEATURES]
+
+        background_encoded = encode_frame(background)
+        customer_encoded = encode_frame(customer)
+
+        classes = list(estimator.classes_)
+        if 1 not in classes:
+            return None, "Model class 1 for churn was not found."
+
+        churn_index = classes.index(1)
+
+        def predict_probability(array):
+            decoded = decode_frame(array)
+            probabilities = estimator.predict_proba(decoded)
+            return probabilities[:, churn_index]
+
+        masker = shap.maskers.Independent(background_encoded)
+
+        explainer = shap.PermutationExplainer(
+            predict_probability,
+            masker
         )
 
         explanation = explainer(
-            customer[FEATURES],
+            customer_encoded,
             max_evals=2 * len(FEATURES) + 1
         )
 
-        values = np.asarray(explanation.values)
-
-        if values.ndim == 2:
-            values = values[0]
+        values = np.asarray(explanation.values).reshape(-1)
 
         if len(values) != len(FEATURES):
-            return None, "SHAP returned an unexpected feature shape."
+            return None, "Unexpected SHAP output shape."
 
         result = pd.DataFrame({
             "Feature": FEATURES,
@@ -242,34 +313,35 @@ def get_shap_explanation(estimator, customer):
         })
 
         result["Absolute impact"] = result["SHAP value"].abs()
-        result = result.sort_values(
-            "Absolute impact", ascending=False
-        ).head(10)
 
-        return result, None
-
-    except ImportError:
-        return None, (
-            "SHAP is not installed in this environment. Install it with "
-            "`pip install shap` to enable individual explanations."
+        return (
+            result.sort_values(
+                "Absolute impact", ascending=False
+            ).head(10),
+            None
         )
+
     except Exception as e:
-        return None, f"SHAP explanation could not be generated: {e}"
+        return None, f"{type(e).__name__}: {e}"
 
 
 # ---------------------------------------------------------
-# Customer form
+# Customer input form
 # ---------------------------------------------------------
 with st.form("churn_prediction_form"):
 
     st.subheader("Customer Details")
-    col_profile, col_services, col_billing = st.columns([1, 2, 1.2])
+
+    col_profile, col_services, col_billing = st.columns(
+        [1, 2, 1.2]
+    )
 
     with col_profile:
         st.markdown(
             '<div class="section-title">👤 Profile</div>',
             unsafe_allow_html=True
         )
+
         gender = st.selectbox("Gender", ["Female", "Male"])
         senior = st.selectbox("Senior Citizen", [0, 1])
         partner = st.selectbox("Partner", ["Yes", "No"])
@@ -281,22 +353,27 @@ with st.form("churn_prediction_form"):
             '<div class="section-title">📡 Services</div>',
             unsafe_allow_html=True
         )
+
         svc_left, svc_right = st.columns(2)
 
         with svc_left:
             phone = st.selectbox("Phone Service", ["Yes", "No"])
+
             multiple_lines = st.selectbox(
                 "Multiple Lines",
                 ["No", "Yes", "No phone service"]
             )
+
             internet = st.selectbox(
                 "Internet Service",
                 ["DSL", "Fiber optic", "No"]
             )
+
             security = st.selectbox(
                 "Online Security",
                 ["No", "Yes", "No internet service"]
             )
+
             backup = st.selectbox(
                 "Online Backup",
                 ["No", "Yes", "No internet service"]
@@ -307,14 +384,17 @@ with st.form("churn_prediction_form"):
                 "Device Protection",
                 ["No", "Yes", "No internet service"]
             )
+
             support = st.selectbox(
                 "Tech Support",
                 ["No", "Yes", "No internet service"]
             )
+
             streaming_tv = st.selectbox(
                 "Streaming TV",
                 ["No", "Yes", "No internet service"]
             )
+
             streaming_movies = st.selectbox(
                 "Streaming Movies",
                 ["No", "Yes", "No internet service"]
@@ -325,13 +405,16 @@ with st.form("churn_prediction_form"):
             '<div class="section-title">💳 Contract & Billing</div>',
             unsafe_allow_html=True
         )
+
         contract = st.selectbox(
             "Contract",
             ["Month-to-month", "One year", "Two year"]
         )
+
         paperless = st.selectbox(
             "Paperless Billing", ["Yes", "No"]
         )
+
         payment = st.selectbox(
             "Payment Method",
             [
@@ -341,20 +424,27 @@ with st.form("churn_prediction_form"):
                 "Credit card (automatic)"
             ]
         )
+
         monthly_charges = st.number_input(
-            "Monthly Charges", min_value=0.0, value=70.0
+            "Monthly Charges",
+            min_value=0.0,
+            value=70.0
         )
+
         total_charges = st.number_input(
-            "Total Charges", min_value=0.0, value=840.0
+            "Total Charges",
+            min_value=0.0,
+            value=840.0
         )
 
     submitted = st.form_submit_button(
-        "Predict Churn", use_container_width=True
+        "Predict Churn",
+        use_container_width=True
     )
 
 
 # ---------------------------------------------------------
-# Prediction and visual explanations
+# Predict once and store the customer for subsequent reruns
 # ---------------------------------------------------------
 if submitted:
     customer = pd.DataFrame([{
@@ -382,124 +472,151 @@ if submitted:
     try:
         prediction = model.predict(customer)[0]
 
-        st.divider()
-        st.subheader("Prediction Result")
-
-        churn_probability = None
+        st.session_state["churn_customer"] = customer
+        st.session_state["churn_prediction"] = prediction
+        st.session_state["churn_prediction_error"] = None
+        st.session_state["shap_result"] = None
+        st.session_state["shap_error"] = None
 
         if hasattr(model, "predict_proba"):
             probabilities = model.predict_proba(customer)[0]
             classes = list(model.classes_)
 
             if 1 not in classes:
-                st.error(
+                st.session_state["churn_prediction_error"] = (
                     "The model's class labels do not include 1. "
-                    "Check how Churn was encoded during training."
+                    "Check the target encoding used during training."
                 )
-                st.stop()
-
-            churn_probability = float(
-                probabilities[classes.index(1)]
-            )
-
-            result_col, probability_col = st.columns([1, 1])
-
-            with result_col:
-                if prediction == 1:
-                    st.error("⚠️ Customer may churn")
-                else:
-                    st.success("✅ Customer may stay")
-
-            with probability_col:
-                st.metric(
-                    "Estimated churn probability",
-                    f"{churn_probability:.1%}"
-                )
-                st.progress(
-                    max(0.0, min(1.0, churn_probability))
-                )
-                st.caption(
-                    "This is the model's estimated probability, "
-                    "not a guarantee of future behaviour."
-                )
-        else:
-            if prediction == 1:
-                st.error("⚠️ Customer may churn")
             else:
-                st.success("✅ Customer may stay")
-
-            st.info(
-                "This model does not provide churn probabilities."
-            )
-
-        # -------------------------------------------------
-        # Overall feature importance
-        # -------------------------------------------------
-        st.divider()
-        st.subheader("What influences churn overall?")
-        st.caption(
-            "This chart shows global model importance, when the saved "
-            "classifier exposes a supported importance measure. It does "
-            "not explain the current customer individually."
-        )
-
-        importance = get_feature_importance(model, FEATURES)
-
-        if importance is not None and not importance.empty:
-            importance_chart = importance.set_index("Feature")
-            st.bar_chart(importance_chart["Importance"])
+                st.session_state["churn_probability"] = float(
+                    probabilities[classes.index(1)]
+                )
         else:
-            st.info(
-                "The saved model does not expose a compatible built-in "
-                "feature importance or coefficient measure. A separate "
-                "model-agnostic importance analysis would be needed."
-            )
-
-        # -------------------------------------------------
-        # Individual SHAP explanation
-        # -------------------------------------------------
-        st.divider()
-        st.subheader("Why did the model make this prediction?")
-        st.caption(
-            "SHAP estimates how each feature moves the model score "
-            "relative to a background set of customers. Positive values "
-            "push towards churn; negative values push away from churn."
-        )
-
-        if st.button(
-            "Explain this prediction with SHAP",
-            key="explain_prediction"
-        ):
-            with st.spinner("Calculating the explanation..."):
-                shap_result, shap_error = get_shap_explanation(
-                    model, customer
-                )
-
-            if shap_error:
-                st.warning(shap_error)
-            elif shap_result is not None:
-                chart_data = shap_result.set_index("Feature")[
-                    "SHAP value"
-                ].sort_values()
-
-                st.bar_chart(chart_data)
-
-                st.markdown("**Largest feature contributions**")
-                st.dataframe(
-                    shap_result[["Feature", "SHAP value"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                st.caption(
-                    "These values explain the model score relative to "
-                    "the selected background records. They are not "
-                    "causal effects."
-                )
+            st.session_state["churn_probability"] = None
 
     except Exception as e:
-        st.error(
-            f"Prediction or explanation failed: {e}. Check that the "
-            "saved model expects these 19 input features."
+        st.session_state["churn_prediction_error"] = (
+            f"Prediction failed: {type(e).__name__}: {e}"
         )
-```
+
+
+# ---------------------------------------------------------
+# Display stored prediction and explanations
+# This remains visible after the SHAP button is clicked.
+# ---------------------------------------------------------
+if st.session_state.get("churn_prediction_error"):
+    st.error(st.session_state["churn_prediction_error"])
+
+elif "churn_customer" in st.session_state:
+    customer = st.session_state["churn_customer"]
+    prediction = st.session_state["churn_prediction"]
+    churn_probability = st.session_state.get("churn_probability")
+
+    st.divider()
+    st.subheader("Prediction Result")
+
+    result_col, probability_col = st.columns([1, 1])
+
+    with result_col:
+        if prediction == 1:
+            st.error("⚠️ Customer may churn")
+        else:
+            st.success("✅ Customer may stay")
+
+    with probability_col:
+        if churn_probability is not None:
+            st.metric(
+                "Estimated churn probability",
+                f"{churn_probability:.1%}"
+            )
+            st.progress(
+                max(0.0, min(1.0, churn_probability))
+            )
+        else:
+            st.info("This model does not provide churn probabilities.")
+
+    st.caption(
+        "The prediction is an estimate from the trained model, "
+        "not a guarantee of future customer behaviour."
+    )
+
+    # -----------------------------------------------------
+    # Global feature importance
+    # -----------------------------------------------------
+    st.divider()
+    st.subheader("What influences churn overall?")
+
+    importance = get_feature_importance(model, FEATURES)
+
+    if importance is not None and not importance.empty:
+        importance_chart = importance.set_index("Feature")[
+            "Importance"
+        ]
+
+        st.bar_chart(importance_chart)
+
+        st.caption(
+            "This is overall model importance, not an explanation "
+            "of this individual customer's prediction."
+        )
+    else:
+        st.info(
+            "This model does not expose a supported built-in feature "
+            "importance measure. SHAP can still be attempted below."
+        )
+
+    # -----------------------------------------------------
+    # Individual SHAP explanation
+    # -----------------------------------------------------
+    st.divider()
+    st.subheader("Why did the model make this prediction?")
+
+    st.markdown(
+        "- **Positive SHAP value:** pushes the model score towards churn.\n"
+        "- **Negative SHAP value:** pushes the model score away from churn.\n"
+        "- Larger absolute values indicate a stronger contribution "
+        "to the model score."
+    )
+
+    if st.button(
+        "Explain this prediction with SHAP",
+        key="explain_prediction"
+    ):
+        st.session_state["shap_result"] = None
+        st.session_state["shap_error"] = None
+
+        with st.spinner(
+            "Calculating SHAP explanation. This may take a little time..."
+        ):
+            shap_result, shap_error = get_shap_explanation(
+                model, customer
+            )
+
+        st.session_state["shap_result"] = shap_result
+        st.session_state["shap_error"] = shap_error
+
+    # Read stored explanation after every rerun.
+    if st.session_state.get("shap_error"):
+        st.warning(st.session_state["shap_error"])
+
+    shap_result = st.session_state.get("shap_result")
+
+    if shap_result is not None:
+        chart_data = shap_result.set_index("Feature")[
+            "SHAP value"
+        ].sort_values()
+
+        st.markdown("**Feature contributions for this customer**")
+        st.bar_chart(chart_data)
+
+        st.dataframe(
+            shap_result[["Feature", "SHAP value"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.caption(
+            "SHAP values explain the model score relative to the "
+            "background customers. They describe model behaviour, "
+            "not causal effects."
+        )
