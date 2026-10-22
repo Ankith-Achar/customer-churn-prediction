@@ -26,7 +26,7 @@ st.markdown(
         --radius: 10px;
     }
     .block-container {
-        padding-top: 1.6rem;
+        padding-top: 0;
         padding-bottom: 1.2rem;
         max-width: 1250px;
     }
